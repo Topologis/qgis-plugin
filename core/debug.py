@@ -11,6 +11,6 @@ LOG_TAG = "Topologis"
 
 def debug_log(message: str):
     """Write a debug message to the QGIS log when ``TOPOLOGIS_DEBUG`` is set."""
-    if not DEBUG:
-        return
+    # if not DEBUG:
+    #     return
     QgsMessageLog.logMessage(str(message), LOG_TAG, QGIS_INFO_LEVEL)

@@ -8,24 +8,36 @@ about HTTP status codes or JSON shapes.
 from typing import Optional, Tuple
 
 from .config import API_URL
-from .http_client import get_json
+from .http_client import post_json
 
 
-def request_anonymous_session() -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """Mint a one-off preview token by hitting ``/api/public/anonymous-session``.
+def sync_anonymous_session(
+    token: Optional[str], session: Optional[str]
+) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """POST whatever ``(token, session)`` we have (either, both, or neither) to
+    ``/api/public/anonymous-session`` and return the fresh ``(token, session,
+    error)`` the server hands back.
 
-    Returns ``(token, session, error)``. On success ``error`` is ``None``;
-    on any failure ``token`` and ``session`` are ``None`` and ``error``
-    carries a message suitable for inline display. ``session`` is an opaque
-    string the caller is expected to append to the preview URL so the server
-    can identify which anonymous bucket to read.
+    The server is the sole authority on this pair: it validates when both are
+    present, rotates them when stale or revoked, and mints from scratch on an
+    empty body. Callers persist the returned pair for next time.
     """
-    status, body = get_json(f"{API_URL}/api/public/anonymous-session")
-    if status == 200 and isinstance(body, dict) and body.get("token"):
-        session = body.get("session")
-        return str(body["token"]), str(session) if session else None, None
+    payload = {}
+    if token:
+        payload["token"] = token
+    if session:
+        payload["session"] = session
 
-    # Surface a server-provided message when present, otherwise fall back to
-    # a generic line that still tells the user which step failed.
+    status, body = post_json(f"{API_URL}/api/public/anonymous-session", payload)
+    if (
+        status == 200
+        and isinstance(body, dict)
+        and body.get("token")
+        and body.get("session")
+    ):
+        return str(body["token"]), str(body["session"]), None
+
+    # Surface a server-provided message when present, otherwise fall back to a
+    # generic line that still tells the user which step failed.
     err = body.get("error") if isinstance(body, dict) else None
     return None, None, err or f"Could not start anonymous session (HTTP {status})"
