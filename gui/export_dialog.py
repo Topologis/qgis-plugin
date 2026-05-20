@@ -10,6 +10,7 @@ import base64
 import json
 import os
 import time
+from typing import Tuple
 
 from qgis.core import (
     QgsApplication,
@@ -17,10 +18,11 @@ from qgis.core import (
     QgsSettings,
     QgsVectorLayer,
 )
-from qgis.PyQt.QtCore import pyqtSignal
-from qgis.PyQt.QtGui import QPixmap
+from qgis.PyQt.QtCore import QUrl, pyqtSignal
+from qgis.PyQt.QtGui import QDesktopServices, QPixmap
 from qgis.PyQt.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -40,6 +42,7 @@ from ..compat import (
     QDIALOG_CANCEL,
     QHEADER_RESIZE_TO_CONTENTS,
     QHEADER_STRETCH,
+    QPALETTE_WINDOW,
     QSTYLE_WARNING_ICON,
     QT_ALIGN_LEFT,
     QT_CHECKED,
@@ -50,18 +53,25 @@ from ..compat import (
     QT_USER_ROLE,
     is_supported_vector_geometry_type,
 )
+from ..core.api import sync_anonymous_session
+from ..core.config import API_URL
 from ..core.export_task import ExportTask
-
 
 # Resource paths are resolved relative to the plugin root, which is the
 # parent of this ``gui/`` package.
 _PLUGIN_DIR = os.path.dirname(os.path.dirname(__file__))
-_LOGO_PATH = os.path.join(_PLUGIN_DIR, "resources", "icons", "logo.png")
+_HEADER_LIGHT_PATH = os.path.join(_PLUGIN_DIR, "resources", "icons", "qgis-header.png")
+_HEADER_DARK_PATH = os.path.join(
+    _PLUGIN_DIR, "resources", "icons", "qgis-header-dark.png"
+)
+# Last-resort fallback if the bundled headers are stripped (e.g. forks that
+# remove the wordmark for trademark reasons) - the toolbar icon is generic.
 _ICON_FALLBACK_PATH = os.path.join(_PLUGIN_DIR, "resources", "icons", "icon.png")
 
-# Help link shown next to the token input. Documentation explains how to
-# generate an import token from a Topologis project's settings.
-DOCS_TOKEN_URL = "https://topologis.com/docs/topologis-app/import-data#qgis"
+# Canonical docs page explaining how to generate an import token. Surfaced
+# both next to the token field and inside the info box shown when the field
+# is empty.
+DOCS_TOKEN_URL = "https://topologis.com/docs/qgis/obtaining-a-token"
 
 # We can only export vector layers with simple Point/Line/Polygon geometry.
 # The helper handles QGIS 3/4 enum-family differences.
@@ -71,6 +81,30 @@ UNSUPPORTED_WARNING = "layer doesn't contain Polygon/Line/Point geometry"
 # don't have to paste it every time. Stored unencrypted - same trust model
 # as other QGIS plugins keeping API keys here.
 TOKEN_SETTINGS_KEY = "topologis/import_token"
+
+# Whether to open the resulting view in a browser after a successful export.
+# Stored separately so it survives across sessions independently of the token.
+OPEN_IN_BROWSER_SETTINGS_KEY = "topologis/open_in_browser"
+
+# Anonymous (token, session) pair persisted after every Preview click and
+# echoed back to the server on the next click. The server validates,
+# rotates, or fully re-mints based on whatever subset we send. The
+# pasted-token (Export) flow never reads or writes these keys.
+ANON_TOKEN_SETTINGS_KEY = "topologis/anonymous_token"
+ANON_SESSION_SETTINGS_KEY = "topologis/anonymous_session"
+
+# Copy shown in the info box under the (empty) token field. Two variants:
+# one for the first Preview (no cached session yet) and one for follow-up
+# Previews where a cached anonymous session is still valid. Edit freely;
+# HTML is supported (the label has ``setOpenExternalLinks(True)``).
+PREVIEW_INFO_NO_CACHE = (
+    "We'll create an anonymous account for you.&nbsp;To keep your data and access it later,&nbsp;sign up and "
+    f'<a href="{DOCS_TOKEN_URL}">get a token</a>.'
+)
+PREVIEW_INFO_CACHED = (
+    "Your data will be imported into your anonymous account.&nbsp;To keep your data and access it later,&nbsp;sign up and "
+    f'<a href="{DOCS_TOKEN_URL}">get a token</a>.'
+)
 
 
 class TopologisExportDialog(QDialog):
@@ -91,14 +125,26 @@ class TopologisExportDialog(QDialog):
         self._task = None
         self._task_running = False
 
+        # Token actually driving the current export. For pasted-token runs
+        # this mirrors the field's value; for Preview runs it's the
+        # anonymous-session token returned by the server. Cleared in
+        # ``_on_task_done`` so a stale value never leaks into the next click.
+        self._active_token = None
+        # Anonymous-session identifier paired with ``_active_token``. Only
+        # set for Preview runs; appended to the preview URL as
+        # ``?session=...`` after a successful export so the view can find
+        # the right anonymous bucket.
+        self._active_session = None
+
         layout = QVBoxLayout(self)
 
         # ---- Branding header ------------------------------------------------
-        # Fall back to the toolbar icon if the logo asset is missing - keeps
-        # the dialog usable for forks that strip the logo for trademark reasons.
-        logo_path = _LOGO_PATH if os.path.exists(_LOGO_PATH) else _ICON_FALLBACK_PATH
+        # Pick a header variant matching the active QGIS theme so the wordmark
+        # stays legible against both light and dark backgrounds.
         logo_label = QLabel(self)
-        logo_label.setPixmap(QPixmap(logo_path).scaledToHeight(32))
+        logo_label.setPixmap(
+            QPixmap(_pick_header_path(self.palette())).scaledToHeight(32)
+        )
         logo_label.setAlignment(QT_ALIGN_LEFT)
         logo_label.setContentsMargins(0, 0, 0, 10)
         layout.addWidget(logo_label)
@@ -110,7 +156,9 @@ class TopologisExportDialog(QDialog):
         self.layer_table.setHorizontalHeaderLabels(["Layer", "Operation"])
         self.layer_table.verticalHeader().setVisible(False)
         self.layer_table.horizontalHeader().setSectionResizeMode(0, QHEADER_STRETCH)
-        self.layer_table.horizontalHeader().setSectionResizeMode(1, QHEADER_RESIZE_TO_CONTENTS)
+        self.layer_table.horizontalHeader().setSectionResizeMode(
+            1, QHEADER_RESIZE_TO_CONTENTS
+        )
         self.layer_table.setEditTriggers(QABSTRACT_NO_EDIT_TRIGGERS)
         self.layer_table.setSelectionMode(QABSTRACT_NO_SELECTION)
         self.layer_table.setShowGrid(False)
@@ -129,9 +177,7 @@ class TopologisExportDialog(QDialog):
             # to fail gracefully when that happens.
             item.setData(QT_USER_ROLE, layer.id())
             if _is_supported(layer):
-                item.setFlags(
-                    QT_ITEM_IS_USER_CHECKABLE | QT_ITEM_IS_ENABLED
-                )
+                item.setFlags(QT_ITEM_IS_USER_CHECKABLE | QT_ITEM_IS_ENABLED)
                 item.setCheckState(QT_UNCHECKED)
                 self.layer_table.setItem(row, 0, item)
 
@@ -176,10 +222,27 @@ class TopologisExportDialog(QDialog):
         token_hint.setStyleSheet("color: #888; font-size: 11px;")
         layout.addWidget(token_hint)
 
+        # Shown only while the token field is empty - explains that the
+        # Preview path produces a temporary export and links to the docs
+        # for users who want a permanent project token instead. The text
+        # itself is swapped by ``_sync_token_dependent_ui`` based on whether
+        # a cached anonymous session is available; the constant here is
+        # just the initial placeholder before that runs.
+        self.token_info_box = QLabel(PREVIEW_INFO_NO_CACHE, self)
+        self.token_info_box.setOpenExternalLinks(True)
+        self.token_info_box.setWordWrap(True)
+        self.token_info_box.setStyleSheet(
+            "background: #fff8e1; border: 1px solid #e0c97f; "
+            "padding: 8px; border-radius: 4px; color: #5a4a00;"
+        )
+        layout.addWidget(self.token_info_box)
+
         # Keep the project/expiry line in sync with the field's real value.
         self.token_input.realTextChanged.connect(self._update_token_info)
         # Pre-fill with the token from a previous session if there is one.
-        self.token_input.setRealText(QgsSettings().value(TOKEN_SETTINGS_KEY, "", type=str))
+        self.token_input.setRealText(
+            QgsSettings().value(TOKEN_SETTINGS_KEY, "", type=str)
+        )
 
         # ---- Status / progress ---------------------------------------------
         self.status_label = QLabel("", self)
@@ -192,35 +255,101 @@ class TopologisExportDialog(QDialog):
         self.progress_bar.hide()
         layout.addWidget(self.progress_bar)
 
-        # ---- Buttons --------------------------------------------------------
-        # Use a single button box that flips between "Close" (idle) and
-        # "Cancel Export" (running). Avoids a layout shift mid-flow.
+        # ---- Bottom row -----------------------------------------------------
+        # Checkbox on the left, buttons on the right. The button box still
+        # flips between "Close" (idle) and "Cancel Export" (running) to avoid
+        # a layout shift mid-flow; the action button's label is driven by
+        # token presence (see ``_sync_token_dependent_ui``).
+        bottom_row = QHBoxLayout()
+
+        self.open_in_browser_checkbox = QCheckBox("Open map in browser", self)
+        # Default True so the no-account path lands on the published view
+        # automatically the first time someone tries the plugin.
+        checked_default = QgsSettings().value(
+            OPEN_IN_BROWSER_SETTINGS_KEY, True, type=bool
+        )
+        self.open_in_browser_checkbox.setChecked(checked_default)
+        # Persist on every toggle so closing the dialog without exporting
+        # still remembers the preference.
+        self.open_in_browser_checkbox.toggled.connect(
+            lambda checked: QgsSettings().setValue(
+                OPEN_IN_BROWSER_SETTINGS_KEY, bool(checked)
+            )
+        )
+        bottom_row.addWidget(self.open_in_browser_checkbox)
+        bottom_row.addStretch()
+
         self.buttons = QDialogButtonBox(QDIALOG_CANCEL, parent=self)
         self.cancel_button = self.buttons.button(QDIALOG_CANCEL)
         self.cancel_button.setText("Close")
-        self.export_button = self.buttons.addButton("Export", QDIALOG_ACCEPT_ROLE)
+        self.action_button = self.buttons.addButton("Export", QDIALOG_ACCEPT_ROLE)
         self.buttons.rejected.connect(self._on_cancel_clicked)
-        self.export_button.clicked.connect(self._on_export)
-        layout.addWidget(self.buttons)
+        self.action_button.clicked.connect(self._on_action)
+        bottom_row.addWidget(self.buttons)
+
+        layout.addLayout(bottom_row)
+
+        # Drive the action button's label and the info box's visibility off
+        # the live token value. ``textChanged`` covers in-progress typing;
+        # ``realTextChanged`` covers programmatic ``setRealText`` calls and
+        # focus-out commits.
+        self.token_input.textChanged.connect(self._sync_token_dependent_ui)
+        self.token_input.realTextChanged.connect(self._sync_token_dependent_ui)
+        self._sync_token_dependent_ui()
 
     # ------------------------------------------------------------------
     # Event handlers.
     # ------------------------------------------------------------------
 
-    def _on_export(self):
-        """Validate inputs and start the export task."""
-        token = self.token_input.realText().strip()
-        layers = self._collect_selected_layers()
+    def _on_action(self):
+        """Validate inputs, source a token if needed, and start the export.
 
-        if not token:
-            self._show_inline("Paste an Import Token first.", error=True)
-            return
+        Single entry point for the dialog's primary button. The button's
+        label is "Export" when the user has pasted a token and "Preview"
+        when the field is empty; the empty-field branch always POSTs
+        whatever anonymous ``(token, session)`` pair we have cached (possibly
+        nothing) to ``/api/public/anonymous-session`` and uses what the
+        server returns. The pair is persisted but never shown in the field.
+        """
+        layers = self._collect_selected_layers()
         if not layers:
             self._show_inline("Select at least one layer.", error=True)
             return
 
-        # Persist the token so the next run pre-fills it.
-        QgsSettings().setValue(TOKEN_SETTINGS_KEY, token)
+        pasted = self.token_input.realText().strip()
+        active_session = None
+        if pasted:
+            # Export mode: use the pasted token and persist it for next run.
+            # The anonymous-session cache is intentionally not consulted or
+            # touched here - a pasted token wins outright.
+            QgsSettings().setValue(TOKEN_SETTINGS_KEY, pasted)
+            active_token = pasted
+        else:
+            # Preview mode: POST whatever (token, session) we have cached
+            # (possibly nothing). The server validates / rotates / mints as
+            # needed and returns a fresh pair we persist for next time.
+            # Buttons stay disabled across the round-trip so the dialog
+            # can't be re-entered while the synchronous call is in flight.
+            self._set_buttons_enabled(False)
+            self._show_inline("Starting anonymous session...")
+            # Force the disabled state + status message to repaint before
+            # the synchronous POST blocks the UI thread.
+            QApplication.processEvents()
+            cached_token, cached_session = _load_cached_anonymous_session()
+            active_token, active_session, error = sync_anonymous_session(
+                cached_token, cached_session
+            )
+            self._set_buttons_enabled(True)
+            if error:
+                self._show_inline(error, error=True)
+                return
+            _store_cached_anonymous_session(active_token, active_session)
+            # Cache may have just gained a fresh entry; refresh the info-box
+            # copy so the swap is visible if the user returns to this dialog.
+            self._sync_token_dependent_ui()
+
+        self._active_token = active_token
+        self._active_session = active_session
 
         self._set_running(True)
         self._total_layers = len(layers)
@@ -229,15 +358,19 @@ class TopologisExportDialog(QDialog):
 
         # Hand the task to QGIS's task manager so it shows up in the global
         # task panel and runs on a worker thread.
-        self._task = ExportTask(token, layers)
+        self._task = ExportTask(active_token, layers)
         self._task.progressUpdated.connect(self._on_progress)
         self._task.done.connect(self._on_task_done)
         QgsApplication.taskManager().addTask(self._task)
 
-    def _on_progress(self, current: int, total: int, layer_name: str, pct: int, phase: str):
+    def _on_progress(
+        self, current: int, total: int, layer_name: str, pct: int, phase: str
+    ):
         """Render an inline status string for the current layer's progress."""
         suffix = "preparing..." if phase == "preparing" else f"{pct}%"
-        self.status_label.setText(f"Importing layer {current}/{total}: {layer_name} ({suffix})")
+        self.status_label.setText(
+            f"Importing layer {current}/{total}: {layer_name} ({suffix})"
+        )
         if self._task is not None:
             # ``QgsTask.progress()`` returns the overall 0..100 percentage we
             # set inside the task; mirror it here for the inline progress bar.
@@ -247,6 +380,14 @@ class TopologisExportDialog(QDialog):
         """Render the final summary once the task has completed or cancelled."""
         task = self._task
         self._task = None
+        active_token = self._active_token
+        active_session = self._active_session
+        # Always clear the active token/session so a follow-up click doesn't
+        # reuse stale state. The QSettings cache is independent and stays
+        # untouched - the next Preview click will POST it to the server and
+        # the server decides whether to rotate, revalidate, or re-mint.
+        self._active_token = None
+        self._active_session = None
         self._set_running(False)
         self.progress_bar.hide()
 
@@ -276,6 +417,26 @@ class TopologisExportDialog(QDialog):
             self.status_label.setToolTip(
                 "\n".join(f"{f['layerName']}: {f['error']}" for f in failures)
             )
+
+        # If the user opted in and at least one layer landed, open the view
+        # in a browser. ``viewId`` is decoded from the token used for this
+        # run, so both pasted-token and Preview flows share one code path;
+        # the ``?session=...`` query param is appended only for Preview
+        # runs, where the server needs it to find the anonymous bucket.
+        if (
+            self.open_in_browser_checkbox.isChecked()
+            and not cancelled
+            and successes
+            and active_token
+        ):
+            view_id = _decode_view_id(active_token)
+            if view_id:
+                url = f"{API_URL}/view/{view_id}"
+                if active_session:
+                    # Server returns a URL-safe value (already percent-encoded
+                    # where needed) - append as-is to avoid double-encoding.
+                    url += f"?session={active_session}"
+                QDesktopServices.openUrl(QUrl(url))
 
     def _on_cancel_clicked(self):
         """Bottom-right button click. Cancels the task or closes the dialog."""
@@ -365,17 +526,65 @@ class TopologisExportDialog(QDialog):
         self._task_running = running
         self.layer_table.setEnabled(not running)
         self.token_input.setEnabled(not running)
-        self.export_button.setEnabled(not running)
+        self.action_button.setEnabled(not running)
         self.cancel_button.setText("Cancel Export" if running else "Close")
         if running:
             self.progress_bar.show()
             self.status_label.setToolTip("")
 
+    def _set_buttons_enabled(self, enabled: bool):
+        """Enable or disable the dialog's primary buttons together.
+
+        Used to lock the UI for the short anonymous-session round-trip when
+        no task has been created yet - ``_set_running`` would be misleading
+        there because the export task hasn't started.
+        """
+        self.action_button.setEnabled(enabled)
+        self.cancel_button.setEnabled(enabled)
+
+    def _sync_token_dependent_ui(self, *_):
+        """Flip the action button label and toggle the info box based on
+        whether the token field currently holds anything. When the field is
+        empty, also pick the info-box copy variant that matches the current
+        cache state (cached preview available vs. fresh mint required).
+
+        Accepts and ignores positional args so the same slot can be wired
+        to both ``textChanged(str)`` and ``realTextChanged(str)``.
+        """
+        has_token = bool(self.token_input.realText().strip())
+        self.action_button.setText("Export" if has_token else "Preview")
+        self.token_info_box.setVisible(not has_token)
+        if not has_token:
+            cached_token, cached_session = _load_cached_anonymous_session()
+            if cached_token and cached_session:
+                self.token_info_box.setText(PREVIEW_INFO_CACHED)
+            else:
+                self.token_info_box.setText(PREVIEW_INFO_NO_CACHE)
+
+
+def _pick_header_path(palette) -> str:
+    """Return the header asset best matching the current Qt palette.
+
+    QGIS doesn't expose its theme directly, so we sniff the window-background
+    luminance (Rec. 601 luma weights, 0..255 scale): below 128 we treat the
+    palette as dark. Each candidate is checked for existence so a stripped
+    install gracefully degrades to the toolbar icon.
+    """
+    bg = palette.color(QPALETTE_WINDOW)
+    luminance = 0.299 * bg.red() + 0.587 * bg.green() + 0.114 * bg.blue()
+    preferred = _HEADER_DARK_PATH if luminance < 128 else _HEADER_LIGHT_PATH
+    for path in (preferred, _HEADER_LIGHT_PATH, _ICON_FALLBACK_PATH):
+        if os.path.exists(path):
+            return path
+    return _ICON_FALLBACK_PATH
+
 
 def _is_supported(layer) -> bool:
     """Return ``True`` if ``layer`` is a vector layer with a geometry type
     we know how to export."""
-    return (isinstance(layer, QgsVectorLayer) and is_supported_vector_geometry_type(layer.geometryType()))
+    return isinstance(layer, QgsVectorLayer) and is_supported_vector_geometry_type(
+        layer.geometryType()
+    )
 
 
 class MaskedTokenLineEdit(QLineEdit):
@@ -429,13 +638,12 @@ class MaskedTokenLineEdit(QLineEdit):
             super().setText(self.MASKED_DISPLAY)
 
 
-def _decode_token_info(token: str):
+def _decode_jwt_payload(token: str):
     """Best-effort decode of a JWT payload (no signature verification).
 
-    Returns ``{"project_name": str, "expires_in_days": int}`` for a parseable
-    token carrying both ``projectName`` and ``exp`` claims, or ``None`` for
-    anything else. The same fallback covers every failure mode (not a JWT,
-    bad base64, bad JSON, missing claims) - the UI doesn't distinguish them.
+    Returns the parsed payload dict, or ``None`` for anything we can't read
+    (not a JWT, bad base64, bad JSON). Every failure mode collapses to the
+    same fallback - readers handle missing claims themselves.
     """
     if not token:
         return None
@@ -446,10 +654,54 @@ def _decode_token_info(token: str):
         payload_b64 = parts[1]
         # JWT uses base64url with no padding; pad up to a multiple of 4.
         padding = "=" * (-len(payload_b64) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(payload_b64 + padding))
+        return json.loads(base64.urlsafe_b64decode(payload_b64 + padding))
+    except Exception:
+        return None
+
+
+def _decode_token_info(token: str):
+    """Pull project + expiry out of a token's payload for the muted hint
+    below the token field. ``None`` when either claim is missing."""
+    payload = _decode_jwt_payload(token)
+    if payload is None:
+        return None
+    try:
         project_name = payload["projectName"]
         exp = payload["exp"]
         expires_in_days = int((float(exp) - time.time()) // 86400)
         return {"project_name": str(project_name), "expires_in_days": expires_in_days}
-    except Exception:
+    except (KeyError, ValueError, TypeError):
         return None
+
+
+def _decode_view_id(token: str):
+    """Pull the ``viewId`` claim out of a token, or ``None`` if absent."""
+    payload = _decode_jwt_payload(token)
+    if not payload:
+        return None
+    view_id = payload.get("viewId")
+    return str(view_id) if view_id else None
+
+
+def _load_cached_anonymous_session() -> Tuple[str, str]:
+    """Return the stored anonymous ``(token, session)`` pair, with empty
+    strings for any key that isn't set yet.
+
+    The server is the authority on validity: callers POST whatever subset
+    is non-empty back to ``/api/public/anonymous-session`` and use whatever
+    pair the server returns.
+    """
+    settings = QgsSettings()
+    return (
+        settings.value(ANON_TOKEN_SETTINGS_KEY, "", type=str),
+        settings.value(ANON_SESSION_SETTINGS_KEY, "", type=str),
+    )
+
+
+def _store_cached_anonymous_session(token: str, session: str):
+    """Persist the server-issued anonymous ``(token, session)`` pair so the
+    next Preview click can echo it back to ``/api/public/anonymous-session``.
+    """
+    settings = QgsSettings()
+    settings.setValue(ANON_TOKEN_SETTINGS_KEY, token or "")
+    settings.setValue(ANON_SESSION_SETTINGS_KEY, session or "")
