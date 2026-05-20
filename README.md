@@ -1,13 +1,13 @@
 # Topologis QGIS Plugin
 
-Publish vector layers from QGIS to a [Topologis](https://topologis.com) project in a couple of clicks.
+Publish vector layers from QGIS to a [Topologis](https://topologis.com) project online, ready for sharing.
 
 ## Features
 
 - Pick any subset of the loaded vector layers.
-- Automatic reprojection to EPSG:4326 (WGS84) on the fly.
-- Background upload via the QGIS task manager, with a cancellable progress bar.
-- Token-based auth - paste once, persisted across sessions.
+- Choose whether you want to replace existing or create new layers in your Topologis project.
+- Preview your interactive map without a Topologis account.
+- Sign up for a Topologis account to create an import token to easily re-upload your data.
 
 Supports Point, Line, and Polygon layers. Raster, mesh, and other layer types are listed but disabled.
 
@@ -35,14 +35,17 @@ Plugins -> Manage and Install Plugins -> search "Topologis".
 ## Project layout
 
 ```
-plugins/qgis/
 ├── __init__.py              # QGIS classFactory entry point
 ├── metadata.txt             # plugin manifest read by QGIS
 ├── topologis_plugin.py      # toolbar/menu wiring
+├── compat.py                # QGIS 3/4 (Qt 5/6) compatibility shims
+├── build.sh                 # packages the plugin into a QGIS-installable zip
 ├── core/
 │   ├── config.py            # API endpoint configuration
+│   ├── api.py               # typed wrappers around Topologis API endpoints
+│   ├── http_client.py       # urllib helpers (POST JSON, PUT with progress)
 │   ├── export_task.py       # background QgsTask
-│   └── http_client.py       # urllib helpers (POST JSON, PUT with progress)
+│   └── debug.py             # debug logging helpers
 ├── gui/
 │   └── export_dialog.py     # the layer-picker dialog
 └── resources/
