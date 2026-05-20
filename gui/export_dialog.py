@@ -70,7 +70,7 @@ _ICON_FALLBACK_PATH = os.path.join(_PLUGIN_DIR, "resources", "icons", "icon.png"
 # Canonical docs page explaining how to generate an import token. Surfaced
 # both next to the token field and inside the info box shown when the field
 # is empty.
-DOCS_TOKEN_URL = "https://topologis.com/docs/qgis-plugin/token"
+DOCS_TOKEN_URL = "https://topologis.com/docs/qgis/obtaining-a-token"
 
 # We can only export vector layers with simple Point/Line/Polygon geometry.
 # The helper handles QGIS 3/4 enum-family differences.

@@ -28,7 +28,7 @@ Plugins -> Manage and Install Plugins -> search "Topologis".
 
 ## Usage
 
-1. Generate an import token in your Topologis project's settings. See the [docs](https://topologis.com/docs/topologis-app/import-data#qgis).
+1. Generate an import token in your Topologis project's settings. See the [docs](https://topologis.com/qgis/obtaining-a-token).
 2. Click the Topologis icon in the toolbar (or Plugins -> Topologis -> Publish to Topologis).
 3. Tick the layers to publish, paste the token, and click **Export**.
 
