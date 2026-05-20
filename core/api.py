@@ -29,12 +29,7 @@ def sync_anonymous_session(
         payload["session"] = session
 
     status, body = post_json(f"{API_URL}/api/public/anonymous-session", payload)
-    if (
-        status == 200
-        and isinstance(body, dict)
-        and body.get("token")
-        and body.get("session")
-    ):
+    if (status == 200 and isinstance(body, dict) and body.get("token") and body.get("session")):
         return str(body["token"]), str(body["session"]), None
 
     # Surface a server-provided message when present, otherwise fall back to a

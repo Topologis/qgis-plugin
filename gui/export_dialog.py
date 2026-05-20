@@ -423,12 +423,7 @@ class TopologisExportDialog(QDialog):
         # run, so both pasted-token and Preview flows share one code path;
         # the ``?session=...`` query param is appended only for Preview
         # runs, where the server needs it to find the anonymous bucket.
-        if (
-            self.open_in_browser_checkbox.isChecked()
-            and not cancelled
-            and successes
-            and active_token
-        ):
+        if (self.open_in_browser_checkbox.isChecked() and not cancelled and successes and active_token):
             view_id = _decode_view_id(active_token)
             if view_id:
                 url = f"{API_URL}/view/{view_id}"
